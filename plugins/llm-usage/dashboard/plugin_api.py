@@ -113,11 +113,14 @@ def _workdir() -> Path:
         path = Path(override).expanduser()
         if path.is_dir():
             return path
+    home = Path.home()
     candidates = [
-        Path.home() / "Projects" / "hermes-llm-usage",
-        Path.home() / "Projects",
-        Path.home() / "Developer",
-        Path.home() / "code",
+        home / "projects" / "hermes-llm-usage",
+        home / "Projects" / "hermes-llm-usage",
+        home / "projects",
+        home / "Projects",
+        home / "Developer",
+        home / "code",
     ]
     for path in candidates:
         if path.is_dir():
@@ -274,6 +277,26 @@ def _claude_window_id(label: str) -> str:
     return "other"
 
 
+def _claude_first_run_dismiss_keys(pane: str) -> list[str] | None:
+    """Keys that dismiss Claude first-run dialogs, or None if the pane is not one."""
+    if "Yes, I trust this folder" in pane:
+        return ["Enter"]
+    if "Try the new fullscreen renderer?" in pane:
+        return ["2", "Enter"]
+    return None
+
+
+def _claude_pane_is_ready(pane: str) -> bool:
+    """True when the Claude TUI composer is live (not a first-run dialog)."""
+    if _claude_first_run_dismiss_keys(pane):
+        return False
+    if re.search(r"(manual mode|^\s*❯|Try \")", pane, re.I | re.M):
+        return True
+    if "Welcome back" not in pane and re.search(r"/\w+", pane):
+        return True
+    return False
+
+
 def fetch_claude_cli_quota_windows() -> tuple[list[dict], str | None]:
     claude_bin = _resolve_bin("claude")
     tmux_bin = _resolve_bin("tmux")
@@ -326,16 +349,21 @@ def fetch_claude_cli_quota_windows() -> tuple[list[dict], str | None]:
             )
             return out.stdout or ""
 
-        # Wait until the TUI prompt is live. Avoid matching Tips copy like
-        # "for shortcuts" on the welcome banner (false ready).
+        # Wait until the TUI composer is live. First-run trust / renderer
+        # dialogs also draw ❯; dismissing them is required before /usage.
         ready = False
-        for _ in range(30):  # up to ~30s
+        for _ in range(40):  # up to ~40s including dialog dismissals
             pane = capture()
-            if re.search(r"(manual mode|^\s*❯|Try \")", pane, re.I | re.M):
-                ready = True
-                break
-            # Also accept a bare bottom prompt once tips chrome is gone.
-            if "Welcome back" not in pane and re.search(r"/\w+", pane):
+            keys = _claude_first_run_dismiss_keys(pane)
+            if keys:
+                subprocess.run(
+                    [tmux_bin, "send-keys", "-t", session, *keys],
+                    check=False,
+                    capture_output=True,
+                )
+                time.sleep(1)
+                continue
+            if _claude_pane_is_ready(pane):
                 ready = True
                 break
             time.sleep(1)
@@ -380,14 +408,20 @@ def parse_grok_usage(text: str) -> list[dict]:
 
     Formats observed:
       - Older: ``Weekly limit left: 42%`` + ``Next reset: ...``  (left → used=100-left)
-      - Current (0.2.x): ``Weekly limit: 12%`` + ``Next reset: August 3, 07:22``
+      - 0.2.x: ``Weekly limit: 12%`` + ``Next reset: August 3, 07:22``
         (value is already percent of the weekly allowance used)
+      - 1.0.x modal: ``Weekly limit (SuperGrok)`` then a bar line ending in ``6%``
+        and ``Resets: September 18, 20:50``
     """
     used_pct: float | None = None
     reset_label: str | None = None
+    plan_name: str | None = None
+    awaiting_bar_pct = False
 
     for raw in text.splitlines():
-        line = raw.strip()
+        # Grok 1.0 wraps the modal in box-drawing bars; strip those so the
+        # existing start-of-line matchers still see the header / bar / reset.
+        line = re.sub(r"[│┃┆┊]+", " ", raw).strip()
         # Prefer the explicit "left" phrasing when present.
         if "Weekly limit left:" in line:
             try:
@@ -397,6 +431,7 @@ def parse_grok_usage(text: str) -> list[dict]:
                 used_pct = max(0.0, min(100.0, 100.0 - left))
             except (IndexError, ValueError):
                 pass
+            awaiting_bar_pct = False
             continue
         if line.startswith("Weekly limit:") and "left" not in line.lower():
             try:
@@ -405,15 +440,31 @@ def parse_grok_usage(text: str) -> list[dict]:
                 used_pct = max(0.0, min(100.0, float(number)))
             except (IndexError, ValueError):
                 pass
+            awaiting_bar_pct = False
+            continue
+        named = re.match(r"Weekly limit\s*\(([^)]+)\)\s*$", line)
+        if named:
+            plan_name = named.group(1).strip() or None
+            awaiting_bar_pct = True
+            continue
+        if awaiting_bar_pct and "%" in line:
+            pct = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+            if pct:
+                used_pct = max(0.0, min(100.0, float(pct.group(1))))
+            awaiting_bar_pct = False
             continue
         if line.startswith("Next reset:"):
             reset_label = line[len("Next reset:") :].strip() or None
+            continue
+        if re.match(r"Resets\s*:", line, re.I):
+            reset_label = line.split(":", 1)[1].strip() or None
 
     if used_pct is None:
         return []
+    label = f"Weekly {plan_name}" if plan_name else "Weekly Grok"
     return [
         {
-            "label": "Weekly Grok",
+            "label": label,
             "used_pct": used_pct,
             "reset_label": reset_label,
             "id": "weekly",
